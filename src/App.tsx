@@ -1,4 +1,6 @@
-import React, { useMemo, useState } from "react";
+import React, { useMemo, useState, useEffect } from "react";
+import { supabase } from "./supabase";
+
 
 /** ZICHRU SCHEDULER – App.tsx (full replacement)
  * - Units-per-day pills (1–6)
