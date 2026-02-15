@@ -271,6 +271,21 @@ type DayItem = { masechta: string; unit: string; tier: Tier };
 type Day = { date: Date; items: DayItem[] };
 
 export default function App() {
+    const [session, setSession] = useState<any>(null);
+  const [email, setEmail] = useState("");
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) =>
+      setSession(data.session)
+    );
+
+    const { data: sub } = supabase.auth.onAuthStateChange(
+      (_event, sess) => setSession(sess)
+    );
+
+    return () => sub.subscription.unsubscribe();
+  }, []);
+
   const ORDER_TIERS = useMemo(splitByOrderThirds, []);
   const [unitsPerDay, setUnitsPerDay] = useState<number>(3);
   const [data] = useState<Record<string, string[]>>({ ...UNITS });
