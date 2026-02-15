@@ -547,6 +547,44 @@ export default function App() {
         <h1 className={`text-4xl md:text-5xl font-extrabold tracking-wider text-center ${neon}`}>
           ZICHRU SCHEDULER
         </h1>
+        {/* Auth box */}
+{!session ? (
+  <div className="max-w-xl mx-auto mt-4 p-4 rounded-2xl bg-white/5 border border-white/10">
+    <div className="font-bold mb-2">Sign in to save your schedule</div>
+    <div className="flex gap-2">
+      <input
+        className="flex-1 px-3 py-2 rounded-xl bg-black/30 border border-white/20 outline-none text-white"
+        placeholder="you@email.com"
+        value={email}
+        onChange={(e) => setEmail(e.target.value)}
+      />
+      <button
+        className="px-4 py-2 rounded-xl bg-cyan-400 text-black font-bold"
+        onClick={async () => {
+          const { error } = await supabase.auth.signInWithOtp({
+            email,
+            options: { emailRedirectTo: window.location.origin },
+          });
+          if (error) alert(error.message);
+          else alert("Check your email for a sign-in link.");
+        }}
+      >
+        Email link
+      </button>
+    </div>
+  </div>
+) : (
+  <div className="max-w-xl mx-auto mt-4 p-3 rounded-2xl bg-white/5 border border-white/10 flex items-center justify-between">
+    <div className="text-sm opacity-90">Signed in as {session.user.email}</div>
+    <button
+      className="text-sm px-3 py-1 rounded-xl border border-white/20 hover:bg-white/10"
+      onClick={() => supabase.auth.signOut()}
+    >
+      Sign out
+    </button>
+  </div>
+)}
+
         <p className="text-center mt-2 text-cyan-200/80">Today: {todayStr}</p>
       </header>
 
