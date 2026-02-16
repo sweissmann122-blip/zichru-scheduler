@@ -1,7 +1,6 @@
 import React, { useMemo, useState, useEffect } from "react";
 import { supabase } from "./supabase";
 
-
 /** ZICHRU SCHEDULER – App.tsx (full replacement)
  * - Units-per-day pills (1–6)
  * - Reviews-per-masechta pills (1–3)
@@ -9,6 +8,9 @@ import { supabase } from "./supabase";
  * - Order-based tiers (first/next/last third of Shas by dapim)
  * - Robust scheduler keeps exact units/day (fills from other tiers if a pool runs out)
  * - Calendar cards + B/W month-grid print (opens in new tab)
+ * - Supabase auth (email OTP)
+ * - Save/Load schedules
+ * - Progress tracking per unit (checkboxes)
  */
 
 // ------------------------------
@@ -147,10 +149,7 @@ const SEDER_OF: Record<
   Niddah: "Taharos",
 };
 
-const SEDER_META: Record<
-  string,
-  { label: string; color: string; border: string }
-> = {
+const SEDER_META: Record<string, { label: string; color: string; border: string }> = {
   Zeraim: { label: "Seder Zeraim", color: "text-emerald-300", border: "border-emerald-400" },
   Moed: { label: "Seder Moed", color: "text-cyan-300", border: "border-cyan-400" },
   Nashim: { label: "Seder Nashim", color: "text-pink-300", border: "border-pink-400" },
@@ -192,7 +191,7 @@ function sumDaf(names: string[]) {
 
 function splitByOrderThirds(): Record<"Easy" | "Medium" | "Hard", string[]> {
   const total = sumDaf(DAF_YOMI_ORDER);
-  const target = Math.round(total / 3); // ≈ 914
+  const target = Math.round(total / 3);
   const Easy: string[] = [];
   const Medium: string[] = [];
   const Hard: string[] = [];
@@ -264,23 +263,32 @@ const neon = "drop-shadow-[0_0_10px_rgba(0,255,255,0.8)]";
 const neonPink = "drop-shadow-[0_0_10px_rgba(255,0,180,0.8)]";
 
 // ------------------------------
-// App
+// Types
 // ------------------------------
 type Tier = "Easy" | "Medium" | "Hard";
 type DayItem = { masechta: string; unit: string; tier: Tier };
 type Day = { date: Date; items: DayItem[] };
 
+// Progress key helper
+const pKey = (dayIndex: number, itemIndex: number) => `${dayIndex}:${itemIndex}`;
+
 export default function App() {
-    const [session, setSession] = useState<any>(null);
+  // Auth
+  const [session, setSession] = useState<any>(null);
   const [email, setEmail] = useState("");
 
-  useEffect(() => {
-    supabase.auth.getSession().then(({ data }) =>
-      setSession(data.session)
-    );
+  // Schedule + persistence
+  const [scheduleId, setScheduleId] = useState<string | null>(null);
+  const [statusMsg, setStatusMsg] = useState<string>("");
 
-    const { data: sub } = supabase.auth.onAuthStateChange(
-      (_event, sess) => setSession(sess)
+  // Progress state (per unit)
+  const [doneMap, setDoneMap] = useState<Record<string, boolean>>({});
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => setSession(data.session));
+
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, sess) =>
+      setSession(sess)
     );
 
     return () => sub.subscription.unsubscribe();
@@ -356,7 +364,9 @@ export default function App() {
     }
     const totalDays = Math.ceil(totalUnits / unitsPerDay);
     const basePatterns =
-      unitsPerDay === 3 ? Array.from({ length: totalDays }, () => ["Easy", "Medium", "Hard"] as Tier[]) : buildRotatingPatterns(unitsPerDay, totalDays);
+      unitsPerDay === 3
+        ? Array.from({ length: totalDays }, () => ["Easy", "Medium", "Hard"] as Tier[])
+        : buildRotatingPatterns(unitsPerDay, totalDays);
 
     // Shuffle pools + round-robin indexes
     const poolIndex: Record<Tier, number> = { Easy: 0, Medium: 0, Hard: 0 };
@@ -423,19 +433,24 @@ export default function App() {
     }
 
     setCalendar(days);
-    // bring calendar into view
+    // new schedule means local progress resets until we load from DB
+    setDoneMap({});
+    setScheduleId(null);
+    setStatusMsg("");
+
     try {
       document.getElementById("calendarTop")?.scrollIntoView({ behavior: "smooth" });
     } catch {}
   }
 
-  // Open simple B/W month grid in a new tab and call print()
+  // ------------------------------
+  // Print: B/W month grid
+  // ------------------------------
   function openBWWindow() {
     if (!calendar || calendar.length === 0) {
       alert("Prepare a schedule first.");
       return;
     }
-    // Group by YYYY-MM
     const byMonth: Record<string, { date: Date; items: { masechta: string; unit: string }[] }[]> =
       {};
     for (const d of calendar) {
@@ -537,6 +552,159 @@ export default function App() {
     }
   }
 
+  // ------------------------------
+  // Supabase: Save / Load schedule
+  // ------------------------------
+  async function saveSchedule() {
+    if (!session?.user) {
+      alert("Please sign in first.");
+      return;
+    }
+    if (!calendar || calendar.length === 0) {
+      alert("Prepare a schedule first.");
+      return;
+    }
+
+    setStatusMsg("Saving...");
+
+    const payload = {
+      user_id: session.user.id,
+      name: "My schedule",
+      units_per_day: unitsPerDay,
+      toggles,
+      repeats,
+      calendar: calendar.map((d) => ({
+        date: d.date.toISOString(),
+        items: d.items,
+      })),
+    };
+
+    const { data, error } = await supabase
+      .from("schedules")
+      .insert(payload)
+      .select("id")
+      .single();
+
+    if (error) {
+      console.error(error);
+      alert(error.message);
+      setStatusMsg("");
+      return;
+    }
+
+    setScheduleId(data.id);
+    setStatusMsg("Saved ✅");
+
+    // after saving, load progress for this schedule (likely empty)
+    await loadProgress(data.id);
+  }
+
+  async function loadLatestSchedule() {
+    if (!session?.user) {
+      alert("Please sign in first.");
+      return;
+    }
+
+    setStatusMsg("Loading...");
+
+    const { data, error } = await supabase
+      .from("schedules")
+      .select("*")
+      .eq("user_id", session.user.id)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .single();
+
+    if (error) {
+      console.error(error);
+      alert(error.message);
+      setStatusMsg("");
+      return;
+    }
+
+    setScheduleId(data.id);
+    setUnitsPerDay(data.units_per_day);
+    setToggles(data.toggles);
+    setRepeats(data.repeats);
+
+    const loaded = (data.calendar as any[]).map((d) => ({
+      date: new Date(d.date),
+      items: d.items,
+    }));
+    setCalendar(loaded);
+
+    setStatusMsg("Loaded ✅");
+    await loadProgress(data.id);
+  }
+
+  // ------------------------------
+  // Supabase: Progress
+  // ------------------------------
+  async function loadProgress(sid: string) {
+    if (!session?.user) return;
+
+    const { data, error } = await supabase
+      .from("progress")
+      .select("day_index,item_index,done")
+      .eq("schedule_id", sid)
+      .eq("user_id", session.user.id);
+
+    if (error) {
+      console.error(error);
+      // Don’t alert on load; it’s noisy
+      return;
+    }
+
+    const next: Record<string, boolean> = {};
+    for (const row of data || []) {
+      next[pKey(row.day_index, row.item_index)] = !!row.done;
+    }
+    setDoneMap(next);
+  }
+
+  async function toggleDone(dayIndex: number, itemIndex: number, nextDone: boolean) {
+    if (!session?.user) {
+      alert("Please sign in to track progress.");
+      return;
+    }
+    if (!scheduleId) {
+      alert("Please save your schedule first (so progress has a schedule to attach to).");
+      return;
+    }
+
+    // optimistic UI
+    const key = pKey(dayIndex, itemIndex);
+    setDoneMap((prev) => ({ ...prev, [key]: nextDone }));
+
+    const payload = {
+      schedule_id: scheduleId,
+      user_id: session.user.id,
+      day_index: dayIndex,
+      item_index: itemIndex,
+      done: nextDone,
+      done_at: nextDone ? new Date().toISOString() : null,
+    };
+
+    // upsert requires a unique constraint / primary key on (schedule_id, day_index, item_index)
+    const { error } = await supabase.from("progress").upsert(payload);
+
+    if (error) {
+      console.error(error);
+      // revert UI if write fails
+      setDoneMap((prev) => ({ ...prev, [key]: !nextDone }));
+      alert(error.message);
+    }
+  }
+
+  const totalItems = useMemo(() => {
+    if (!calendar) return 0;
+    return calendar.reduce((acc, d) => acc + d.items.length, 0);
+  }, [calendar]);
+
+  const doneCount = useMemo(() => {
+    return Object.values(doneMap).filter(Boolean).length;
+  }, [doneMap]);
+
   const todayStr = useMemo(() => new Date().toLocaleDateString(), []);
 
   return (
@@ -547,45 +715,64 @@ export default function App() {
         <h1 className={`text-4xl md:text-5xl font-extrabold tracking-wider text-center ${neon}`}>
           ZICHRU SCHEDULER
         </h1>
+
         {/* Auth box */}
-{!session ? (
-  <div className="max-w-xl mx-auto mt-4 p-4 rounded-2xl bg-white/5 border border-white/10">
-    <div className="font-bold mb-2">Sign in to save your schedule</div>
-    <div className="flex gap-2">
-      <input
-        className="flex-1 px-3 py-2 rounded-xl bg-black/30 border border-white/20 outline-none text-white"
-        placeholder="you@email.com"
-        value={email}
-        onChange={(e) => setEmail(e.target.value)}
-      />
-      <button
-        className="px-4 py-2 rounded-xl bg-cyan-400 text-black font-bold"
-        onClick={async () => {
-          const { error } = await supabase.auth.signInWithOtp({
-            email,
-            options: { emailRedirectTo: window.location.origin },
-          });
-          if (error) alert(error.message);
-          else alert("Check your email for a sign-in link.");
-        }}
-      >
-        Email link
-      </button>
-    </div>
-  </div>
-) : (
-  <div className="max-w-xl mx-auto mt-4 p-3 rounded-2xl bg-white/5 border border-white/10 flex items-center justify-between">
-    <div className="text-sm opacity-90">Signed in as {session.user.email}</div>
-    <button
-      className="text-sm px-3 py-1 rounded-xl border border-white/20 hover:bg-white/10"
-      onClick={() => supabase.auth.signOut()}
-    >
-      Sign out
-    </button>
-  </div>
-)}
+        {!session ? (
+          <div className="max-w-xl mx-auto mt-4 p-4 rounded-2xl bg-white/5 border border-white/10">
+            <div className="font-bold mb-2">Sign in to save your schedule</div>
+            <div className="flex gap-2">
+              <input
+                className="flex-1 px-3 py-2 rounded-xl bg-black/30 border border-white/20 outline-none text-white"
+                placeholder="you@email.com"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+              />
+              <button
+                className="px-4 py-2 rounded-xl bg-cyan-400 text-black font-bold"
+                onClick={async () => {
+                  const { error } = await supabase.auth.signInWithOtp({
+                    email,
+                    options: { emailRedirectTo: window.location.origin },
+                  });
+                  if (error) alert(error.message);
+                  else alert("Check your email for a sign-in link.");
+                }}
+              >
+                Email link
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="max-w-xl mx-auto mt-4 p-3 rounded-2xl bg-white/5 border border-white/10 flex items-center justify-between">
+            <div className="text-sm opacity-90">Signed in as {session.user.email}</div>
+            <button
+              className="text-sm px-3 py-1 rounded-xl border border-white/20 hover:bg-white/10"
+              onClick={() => {
+                supabase.auth.signOut();
+                setScheduleId(null);
+                setDoneMap({});
+                setStatusMsg("");
+              }}
+            >
+              Sign out
+            </button>
+          </div>
+        )}
 
         <p className="text-center mt-2 text-cyan-200/80">Today: {todayStr}</p>
+
+        {/* Progress mini-bar */}
+        {calendar && calendar.length > 0 && (
+          <div className="max-w-xl mx-auto mt-2 text-center text-sm opacity-80">
+            Progress: <span className="text-cyan-300 font-semibold">{doneCount}</span> /{" "}
+            <span className="text-cyan-300 font-semibold">{totalItems}</span>
+            {scheduleId ? (
+              <span className="ml-2 text-xs opacity-60">(saved)</span>
+            ) : (
+              <span className="ml-2 text-xs opacity-60">(not saved yet)</span>
+            )}
+          </div>
+        )}
       </header>
 
       <main className="px-4 md:px-8 lg:px-16">
@@ -612,8 +799,8 @@ export default function App() {
             </div>
 
             <p className="mt-3 text-xs italic text-cyan-100/80">
-              Tier note: Easy/Medium/Hard are determined by order — first third of Shas = Easy, next
-              third = Medium, last third = Hard.
+              Tier note: Easy/Medium/Hard are determined by order — first third of Shas = Easy,
+              next third = Medium, last third = Hard.
             </p>
             <p className="mt-2 text-sm text-cyan-100/80">
               Schedule runs 7 days/week. If set to 3, we aim for Easy + Medium + Hard; if a pool
@@ -624,8 +811,7 @@ export default function App() {
               <span className="text-cyan-300 font-semibold">{totalSelectedUnits}</span>
             </p>
             <p className="text-sm">
-              Estimated days:{" "}
-              <span className="text-cyan-300 font-semibold">{totalDaysNeeded}</span>
+              Estimated days: <span className="text-cyan-300 font-semibold">{totalDaysNeeded}</span>
             </p>
 
             <div className="flex gap-2 flex-wrap mt-3">
@@ -637,7 +823,36 @@ export default function App() {
                 <span className="text-lg">▶</span>
               </button>
             </div>
-            <p className="mt-2 text-xs text-cyan-100/80">Scroll down to see the tabulated schedule.</p>
+
+            {session && (
+              <div className="flex gap-2 flex-wrap mt-3">
+                <button
+                  onClick={saveSchedule}
+                  className="rounded-xl px-4 py-2 bg-emerald-400 text-black font-bold"
+                >
+                  Save Schedule
+                </button>
+                <button
+                  onClick={loadLatestSchedule}
+                  className="rounded-xl px-4 py-2 bg-white/10 border border-white/20 hover:bg-white/20"
+                >
+                  Load Latest
+                </button>
+              </div>
+            )}
+
+            {(statusMsg || scheduleId) && (
+              <div className="mt-2 text-xs opacity-80">
+                {statusMsg && <span>{statusMsg}</span>}
+                {scheduleId && (
+                  <span className="ml-2 opacity-60">id: {scheduleId.slice(0, 8)}…</span>
+                )}
+              </div>
+            )}
+
+            <p className="mt-2 text-xs text-cyan-100/80">
+              Tip: save your schedule before tracking progress.
+            </p>
           </div>
 
           {/* Masechtos list */}
@@ -652,9 +867,7 @@ export default function App() {
                 return (
                   <div key={seder}>
                     <div className="flex items-center justify-between mb-2">
-                      <div
-                        className={`text-sm font-extrabold tracking-wide uppercase ${meta.color}`}
-                      >
+                      <div className={`text-sm font-extrabold tracking-wide uppercase ${meta.color}`}>
                         {meta.label}
                       </div>
                       <button
@@ -688,9 +901,7 @@ export default function App() {
                             <input
                               type="checkbox"
                               checked={!!toggles[m]}
-                              onChange={(e) =>
-                                setToggles({ ...toggles, [m]: e.target.checked })
-                              }
+                              onChange={(e) => setToggles({ ...toggles, [m]: e.target.checked })}
                             />
                             <span>{m}</span>
                           </label>
@@ -750,40 +961,58 @@ export default function App() {
 
           {calendar && calendar.length > 0 && (
             <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-4">
-              {calendar.map((day, idx) => (
+              {calendar.map((day, dayIndex) => (
                 <div
-                  key={idx}
+                  key={dayIndex}
                   className="rounded-2xl p-4 bg-black/40 border border-cyan-400/30 shadow-[0_0_20px_rgba(0,255,255,0.2)]"
                 >
                   <div className="flex items-center justify-between mb-3">
-                    <div className="font-bold text-cyan-300">
-                      {day.date.toLocaleDateString()}
-                    </div>
-                    <div className="text-xs opacity-70">Day {idx + 1}</div>
+                    <div className="font-bold text-cyan-300">{day.date.toLocaleDateString()}</div>
+                    <div className="text-xs opacity-70">Day {dayIndex + 1}</div>
                   </div>
+
                   <ul className="space-y-2">
-                    {day.items.map((it, j) => (
-                      <li
-                        key={j}
-                        className="flex items-center justify-between bg-white/5 rounded-lg px-3 py-2 border border-white/10"
-                      >
-                        <span className="font-semibold">
-                          {it.masechta} <span className="opacity-80">{it.unit}</span>
-                        </span>
-                        <span
-                          className={`text-xs uppercase tracking-wide px-2 py-0.5 rounded border ${
-                            it.tier === "Easy"
-                              ? "border-cyan-300 text-cyan-300"
-                              : it.tier === "Medium"
-                              ? "border-yellow-300 text-yellow-300"
-                              : "border-pink-300 text-pink-300"
-                          }`}
+                    {day.items.map((it, itemIndex) => {
+                      const key = pKey(dayIndex, itemIndex);
+                      const checked = !!doneMap[key];
+                      return (
+                        <li
+                          key={itemIndex}
+                          className="flex items-center justify-between bg-white/5 rounded-lg px-3 py-2 border border-white/10"
                         >
-                          {it.tier}
-                        </span>
-                      </li>
-                    ))}
+                          <div className="flex items-center gap-3">
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              onChange={(e) => toggleDone(dayIndex, itemIndex, e.target.checked)}
+                              title={scheduleId ? "Mark complete" : "Save schedule first to track progress"}
+                            />
+                            <span className="font-semibold">
+                              {it.masechta} <span className="opacity-80">{it.unit}</span>
+                            </span>
+                          </div>
+
+                          <span
+                            className={`text-xs uppercase tracking-wide px-2 py-0.5 rounded border ${
+                              it.tier === "Easy"
+                                ? "border-cyan-300 text-cyan-300"
+                                : it.tier === "Medium"
+                                ? "border-yellow-300 text-yellow-300"
+                                : "border-pink-300 text-pink-300"
+                            }`}
+                          >
+                            {it.tier}
+                          </span>
+                        </li>
+                      );
+                    })}
                   </ul>
+
+                  {!scheduleId && (
+                    <div className="mt-3 text-xs opacity-70">
+                      Save your schedule to enable progress tracking.
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
