@@ -567,17 +567,23 @@ export default function App() {
 
     setStatusMsg("Saving...");
 
-    const payload = {
-      user_id: session.user.id,
-      name: "My schedule",
-      units_per_day: unitsPerDay,
-      toggles,
-      repeats,
-      calendar: calendar.map((d) => ({
-        date: d.date.toISOString(),
-        items: d.items,
-      })),
-    };
+   const payload = {
+  user_id: session.user.id,
+  name: "My schedule",
+  units_per_day: unitsPerDay,
+  total_days: calendar.length,
+  status: "active",
+  calendar: {
+    unitsPerDay,
+    toggles,
+    repeats,
+    days: calendar.map((d) => ({
+      date: d.date.toISOString(),
+      items: d.items,
+    })),
+  },
+};
+
 
     const { data, error } = await supabase
       .from("schedules")
@@ -621,16 +627,17 @@ export default function App() {
       setStatusMsg("");
       return;
     }
+if (!data?.calendar?.days) return;
 
-    setScheduleId(data.id);
-    setUnitsPerDay(data.units_per_day);
-    setToggles(data.toggles);
-    setRepeats(data.repeats);
+   setUnitsPerDay(data.calendar.unitsPerDay);
+setToggles(data.calendar.toggles);
+setRepeats(data.calendar.repeats);
 
-    const loaded = (data.calendar as any[]).map((d) => ({
-      date: new Date(d.date),
-      items: d.items,
-    }));
+const loaded = data.calendar.days.map((d: any) => ({
+  date: new Date(d.date),
+  items: d.items,
+}));
+
     setCalendar(loaded);
 
     setStatusMsg("Loaded ✅");
